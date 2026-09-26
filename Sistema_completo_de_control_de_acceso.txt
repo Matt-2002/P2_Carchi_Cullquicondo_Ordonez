@@ -1,0 +1,316 @@
+/*
+ * Control de acceso RFID: ESP32 + RC522 + servidor Flask.
+ * Requiere rc522 ^2.0.0 (API rc522.h).
+ */
+#define WIFI_SSID   "CBVISION::FML_CULLQUICONDO"
+#define WIFI_PASS   "0107061988"
+#define SERVER_URL  "http://192.168.1.11:5000"   /* IP de PC, sin "/" al final */
+
+#include <inttypes.h>
+#include <stdio.h>
+#include <string.h>
+#include "esp_log.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "esp_timer.h"
+#include "esp_http_client.h"
+#include "nvs_flash.h"
+#include "cJSON.h"
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/event_groups.h"
+#include "rc522.h"
+
+/* RC522 (SPI) */
+#define PIN_MISO 19
+#define PIN_MOSI 23
+#define PIN_SCLK 18
+#define PIN_CS    5
+
+/* Cuadro 3.4 de la guia */
+#define PIN_LED_R  25
+#define PIN_LED_G  26
+#define PIN_LED_B  27
+#define PIN_BUZZER 32
+#define PIN_SERVO  4
+
+#define HTTP_TIMEOUT_MS 3000
+#define WIFI_CONNECTED_BIT BIT0
+
+static const char *TAG = "ACCESO";
+static rc522_handle_t scanner;
+static QueueHandle_t uid_queue;
+static EventGroupHandle_t wifi_events;
+
+typedef enum { ACCESS_GRANTED, ACCESS_DENIED, ACCESS_NET_ERROR } access_t;
+
+/* ---------------- Salidas: LED, buzzer, servo ---------------- */
+
+static void set_led(int r, int g, int b)
+{
+    gpio_set_level(PIN_LED_R, r);
+    gpio_set_level(PIN_LED_G, g);
+    gpio_set_level(PIN_LED_B, b);
+}
+
+static void beep(int ms)
+{
+    gpio_set_level(PIN_BUZZER, 1);
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    gpio_set_level(PIN_BUZZER, 0);
+}
+
+static void servo_angle(int deg)
+{
+    /* Pulso de 0.5 ms (0 grados) a 2.5 ms (180 grados), periodo de 20 ms, 14 bits */
+    uint32_t us = 500 + (uint32_t)(deg * 2000) / 180;
+    uint32_t duty = (us * 16383) / 20000;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+static void outputs_init(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << PIN_LED_R) | (1ULL << PIN_LED_G) |
+                        (1ULL << PIN_LED_B) | (1ULL << PIN_BUZZER),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+    set_led(0, 0, 0);
+    gpio_set_level(PIN_BUZZER, 0);
+
+    ledc_timer_config_t timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .timer_num = LEDC_TIMER_0,
+        .duty_resolution = LEDC_TIMER_14_BIT,
+        .freq_hz = 50,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer));
+    ledc_channel_config_t ch = {
+        .gpio_num = PIN_SERVO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ch));
+    servo_angle(0);
+}
+
+/* ---------------- Wi-Fi ---------------- */
+
+static void wifi_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT);
+        ESP_LOGW(TAG, "Wi-Fi desconectado, reintentando...");
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "Wi-Fi conectado, IP: " IPSTR, IP2STR(&e->ip_info.ip));
+        xEventGroupSetBits(wifi_events, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void wifi_init(void)
+{
+    wifi_events = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_handler, NULL));
+
+    wifi_config_t wc = { 0 };
+    strncpy((char *)wc.sta.ssid, WIFI_SSID, sizeof(wc.sta.ssid) - 1);
+    strncpy((char *)wc.sta.password, WIFI_PASS, sizeof(wc.sta.password) - 1);
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+/* ---------------- Cliente HTTP ---------------- */
+
+typedef struct {
+    char buf[256];
+    int len;
+} http_resp_t;
+
+static esp_err_t http_evt(esp_http_client_event_t *evt)
+{
+    http_resp_t *r = (http_resp_t *)evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA && r) {
+        int n = evt->data_len;
+        if (r->len + n < (int)sizeof(r->buf) - 1) {
+            memcpy(r->buf + r->len, evt->data, n);
+            r->len += n;
+            r->buf[r->len] = '\0';
+        }
+    }
+    return ESP_OK;
+}
+
+static access_t check_uid(const char *uid, char *name, size_t name_sz)
+{
+    char url[160];
+    snprintf(url, sizeof(url), "%s/check?uid=%s", SERVER_URL, uid);
+
+    http_resp_t r = { 0 };
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .timeout_ms = HTTP_TIMEOUT_MS,
+        .event_handler = http_evt,
+        .user_data = &r,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    esp_err_t err = esp_http_client_perform(c);
+    int status = esp_http_client_get_status_code(c);
+    esp_http_client_cleanup(c);
+
+    if (err != ESP_OK || status != 200) {
+        ESP_LOGE(TAG, "Fallo al consultar el servidor (err=%s, http=%d)",
+                 esp_err_to_name(err), status);
+        return ACCESS_NET_ERROR;
+    }
+
+    cJSON *root = cJSON_Parse(r.buf);
+    if (!root) {
+        ESP_LOGE(TAG, "Respuesta no es JSON valido: %s", r.buf);
+        return ACCESS_NET_ERROR;
+    }
+    cJSON *aut = cJSON_GetObjectItem(root, "autorizado");
+    cJSON *nom = cJSON_GetObjectItem(root, "nombre");
+    bool ok = cJSON_IsTrue(aut);
+    if (ok && cJSON_IsString(nom) && nom->valuestring) {
+        snprintf(name, name_sz, "%s", nom->valuestring);
+    }
+    cJSON_Delete(root);
+    return ok ? ACCESS_GRANTED : ACCESS_DENIED;
+}
+
+static void post_log(const char *uid, const char *resultado)
+{
+    char url[160], body[192];
+    snprintf(url, sizeof(url), "%s/log", SERVER_URL);
+    snprintf(body, sizeof(body), "{\"uid\":\"%s\",\"resultado\":\"%s\"}", uid, resultado);
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = HTTP_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    esp_http_client_set_header(c, "Content-Type", "application/json");
+    esp_http_client_set_post_field(c, body, strlen(body));
+    esp_err_t err = esp_http_client_perform(c);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "No se pudo registrar el evento: %s", esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(c);
+}
+
+/* ---------------- Logica de acceso ---------------- */
+
+static void access_task(void *arg)
+{
+    uint64_t sn;
+    for (;;) {
+        if (xQueueReceive(uid_queue, &sn, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        char uid[24];
+        snprintf(uid, sizeof(uid), "%" PRIX64, sn);
+
+        char name[64] = "";
+        int64_t t0 = esp_timer_get_time();
+        access_t res = check_uid(uid, name, sizeof(name));
+        int64_t ms = (esp_timer_get_time() - t0) / 1000;
+
+        if (res == ACCESS_GRANTED) {
+            ESP_LOGI(TAG, "UID %s -> AUTORIZADO (%s) | respuesta en %" PRId64 " ms", uid, name, ms);
+            post_log(uid, "AUTORIZADO");
+            set_led(0, 1, 0);          /* verde */
+            beep(150);                 /* pitido corto */
+            servo_angle(90);           /* puerta abierta */
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            servo_angle(0);            /* puerta cerrada */
+        } else if (res == ACCESS_DENIED) {
+            ESP_LOGW(TAG, "UID %s -> DENEGADO | respuesta en %" PRId64 " ms", uid, ms);
+            post_log(uid, "DENEGADO");
+            set_led(1, 0, 0);          /* rojo */
+            beep(1000);                /* pitido largo */
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        } else {
+            /* Sin servidor: se deniega el acceso y se avisa con 3 parpadeos rojos y 3 pitidos cortos */
+            ESP_LOGE(TAG, "UID %s -> ERROR DE RED, acceso denegado (tardo %" PRId64 " ms)", uid, ms);
+            for (int i = 0; i < 3; i++) {
+                set_led(1, 0, 0);
+                beep(150);
+                set_led(0, 0, 0);
+                vTaskDelay(pdMS_TO_TICKS(150));
+            }
+        }
+
+        set_led(0, 0, 1);              /* azul: listo */
+        xQueueReset(uid_queue);        /* descarta lecturas hechas durante la accion */
+    }
+}
+
+static void on_tag_scanned(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (id != RC522_EVENT_TAG_SCANNED) {
+        return;
+    }
+    rc522_event_data_t *ev = (rc522_event_data_t *)data;
+    rc522_tag_t *tag = (rc522_tag_t *)ev->ptr;
+    uint64_t sn = tag->serial_number;
+    xQueueSend(uid_queue, &sn, 0);     /* no bloquea el manejador del lector */
+}
+
+void app_main(void)
+{
+    esp_err_t r = nvs_flash_init();
+    if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        r = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(r);
+
+    outputs_init();
+    uid_queue = xQueueCreate(1, sizeof(uint64_t));
+
+    wifi_init();
+    EventBits_t bits = xEventGroupWaitBits(wifi_events, WIFI_CONNECTED_BIT,
+                                           pdFALSE, pdTRUE, pdMS_TO_TICKS(15000));
+    if (!(bits & WIFI_CONNECTED_BIT)) {
+        ESP_LOGW(TAG, "Sin Wi-Fi tras 15 s; el sistema seguira reintentando");
+    }
+
+    rc522_config_t cfg = {
+        .spi.host      = SPI3_HOST,
+        .spi.miso_gpio = PIN_MISO,
+        .spi.mosi_gpio = PIN_MOSI,
+        .spi.sck_gpio  = PIN_SCLK,
+        .spi.sda_gpio  = PIN_CS,
+    };
+    ESP_ERROR_CHECK(rc522_create(&cfg, &scanner));
+    ESP_ERROR_CHECK(rc522_register_events(scanner, RC522_EVENT_ANY, on_tag_scanned, NULL));
+
+    xTaskCreate(access_task, "access_task", 8192, NULL, 5, NULL);
+    ESP_ERROR_CHECK(rc522_start(scanner));
+
+    set_led(0, 0, 1);                  /* azul: sistema listo */
+    ESP_LOGI(TAG, "Sistema listo. Acerque una credencial...");
+}
