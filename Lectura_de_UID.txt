@@ -7,15 +7,6 @@
 #define PIN_SCLK 18
 #define PIN_CS    5
 
-#include <inttypes.h>
-#include "esp_log.h"
-#include "rc522.h"
-
-#define PIN_MISO 19
-#define PIN_MOSI 23
-#define PIN_SCLK 18
-#define PIN_CS    5
-
 static const char *TAG = "RFID";
 static rc522_handle_t scanner;
 
